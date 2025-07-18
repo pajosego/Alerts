@@ -1,7 +1,7 @@
 const { sendTelegramAlert } = require('./telegram');
 
 const ALERT_SCORE_THRESHOLD = 3.5;
-const ALERT_COOLDOWN = 30 * 60 * 1000;
+const ALERT_COOLDOWN = 30 * 60 * 1000; // 30 minutos
 const lastAlerts = {};
 
 function canSendAlert(symbol, type) {
@@ -14,12 +14,22 @@ function canSendAlert(symbol, type) {
   return false;
 }
 
-function calculateTP(entry, atr, factor = 1.5) {
+// Para compra
+function calculateTP(entry, atr, factor = 2) {
   return +(entry + factor * atr).toFixed(6);
 }
 
 function calculateSL(entry, atr, factor = 1) {
   return +(entry - factor * atr).toFixed(6);
+}
+
+// Para venda (invertido)
+function calculateTPForSell(entry, atr, factor = 2) {
+  return +(entry - factor * atr).toFixed(6);
+}
+
+function calculateSLForSell(entry, atr, factor = 1) {
+  return +(entry + factor * atr).toFixed(6);
 }
 
 function formatAlertMessage(symbol, type, entry, sl, tp, rsi, macd, adx, score) {
@@ -60,12 +70,16 @@ async function analyzeAndAlert(symbol, indicators, closePrice, chatId) {
 
   if (scoreCompra >= ALERT_SCORE_THRESHOLD && canSendAlert(symbol, "compra")) {
     const entry = closePrice;
-    const msg = formatAlertMessage(symbol, "compra", entry, calculateSL(entry, lastATR), calculateTP(entry, lastATR), lastRSI, lastMACD, lastADX, scoreCompra);
+    const sl = calculateSL(entry, lastATR);
+    const tp = calculateTP(entry, lastATR);
+    const msg = formatAlertMessage(symbol, "compra", entry, sl, tp, lastRSI, lastMACD, lastADX, scoreCompra);
     await sendTelegramAlert(chatId, msg);
     console.log(`[${new Date().toLocaleTimeString()}] Alerta enviado: ${symbol} (COMPRA) Score: ${scoreCompra.toFixed(2)}`);
   } else if (scoreVenda >= ALERT_SCORE_THRESHOLD && canSendAlert(symbol, "venda")) {
     const entry = closePrice;
-    const msg = formatAlertMessage(symbol, "venda", entry, calculateTP(entry, lastATR), calculateSL(entry, lastATR), lastRSI, lastMACD, lastADX, scoreVenda);
+    const sl = calculateSLForSell(entry, lastATR);
+    const tp = calculateTPForSell(entry, lastATR);
+    const msg = formatAlertMessage(symbol, "venda", entry, sl, tp, lastRSI, lastMACD, lastADX, scoreVenda);
     await sendTelegramAlert(chatId, msg);
     console.log(`[${new Date().toLocaleTimeString()}] Alerta enviado: ${symbol} (VENDA) Score: ${scoreVenda.toFixed(2)}`);
   } else {
