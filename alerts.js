@@ -1,86 +1,115 @@
-// alerts.js — lógica de alertas profissionalizada
 const { sendTelegramAlert } = require('./telegram');
 
-const ALERT_SCORE_THRESHOLD = 3.5;
-const ALERT_COOLDOWN = 60 * 60 * 1000; // 1 hora
-const lastAlerts = {};
+const ALERT_COOLDOWN = 60 * 60 * 1000; // 1 hora em ms
+const DAILY_LIMIT = 100;
+
+const alertLog = new Map(); // key: `${symbol}_${type}`, value: timestamp último alerta
+const alertCountByDay = new Map(); // key: data YYYY-MM-DD, value: count de alertas
+
+function resetDailyCount() {
+  const today = new Date().toISOString().slice(0, 10);
+  for (const day of alertCountByDay.keys()) {
+    if (day !== today) alertCountByDay.delete(day);
+  }
+}
 
 function canSendAlert(symbol, type) {
+  resetDailyCount();
   const now = Date.now();
-  if (!lastAlerts[symbol]) lastAlerts[symbol] = {};
-  if (!lastAlerts[symbol][type] || now - lastAlerts[symbol][type] > ALERT_COOLDOWN) {
-    lastAlerts[symbol][type] = now;
+  const key = `${symbol}_${type}`;
+
+  // Verifica limite diário total
+  const today = new Date().toISOString().slice(0, 10);
+  let count = alertCountByDay.get(today) || 0;
+  if (count >= DAILY_LIMIT) return false;
+
+  // Verifica cooldown
+  if (!alertLog.has(key) || now - alertLog.get(key) > ALERT_COOLDOWN) {
+    alertLog.set(key, now);
+    alertCountByDay.set(today, count + 1);
     return true;
   }
   return false;
 }
 
-function calculateTP(entry, atr, direction, rr = 2) {
-  return +(direction === 'long'
-    ? entry + rr * atr
-    : entry - rr * atr).toFixed(6);
+function isStrongCandle(candle) {
+  const bodySize = Math.abs(candle.close - candle.open);
+  const candleRange = candle.high - candle.low;
+  if (candleRange === 0) return false;
+  return bodySize / candleRange > 0.6;
 }
 
-function calculateSL(entry, atr, direction) {
-  return +(direction === 'long'
-    ? entry - atr
-    : entry + atr).toFixed(6);
+function isHighVolume(candle, avgVolume) {
+  return candle.volume > avgVolume * 1.2;
 }
 
-function formatAlertMessage(symbol, type, entry, sl, tp, rsi, macd, adx, score) {
-  const emoji = type === "compra" ? "🚀" : "🛑";
-  return `${emoji} ${type.toUpperCase()} detectada para ${symbol}!
-Entrada: ${entry.toFixed(6)}
-Stop Loss: ${sl.toFixed(6)}
-Take Profit: ${tp.toFixed(6)}
-RSI5m: ${rsi.toFixed(2)}
-MACD30m: ${macd.MACD.toFixed(4)} ${type === "compra" ? ">" : "<"} ${macd.signal.toFixed(4)}
-ADX30m: ${adx.adx.toFixed(2)}
-Score: ${score.toFixed(2)}`;
+function formatAlertMessage(symbol, type, entry, sl, tp, time) {
+  const emoji = type === 'compra' ? '🚀' : '🛑';
+  return `${emoji} ${type.toUpperCase()} confirmada para ${symbol}!\n` +
+         `Entrada: ${entry.toFixed(6)}\n` +
+         `Stop Loss: ${sl.toFixed(6)}\n` +
+         `Take Profit: ${tp.toFixed(6)}\n` +
+         `Horário (UTC): ${time}`;
 }
 
-async function analyzeAndAlert(symbol, indicators, closePrice, chatId) {
-  const { rsi, macd, adx, ema, atr } = indicators;
-  const lastRSI = rsi.at(-1);
-  const lastMACD = macd.at(-1);
-  const lastADX = adx.at(-1);
-  const lastEMA = ema.at(-1);
-  const lastATR = atr.at(-1) || 0;
+async function analyzeAndAlert(symbol, timeframe, candles, pivots, chatId) {
+  if (!pivots) return;
 
-  const isUpTrend = closePrice > lastEMA;
-  const isDownTrend = closePrice < lastEMA;
-  const adxStrong = lastADX?.adx >= 25;
+  const lastCandle = candles.at(-1);
+  const prevCandle = candles.at(-2);
+  if (!lastCandle || !prevCandle) return;
 
-  let scoreCompra = 0;
-  if (lastRSI < 30) scoreCompra += 1.5;
-  if (lastMACD.MACD > lastMACD.signal) scoreCompra += 1.5;
-  if (isUpTrend) scoreCompra += 1;
-  if (adxStrong) scoreCompra += 1;
+  const volumes = candles.map(c => c.volume);
+  const avgVolume = volumes.reduce((a,b) => a+b, 0) / volumes.length;
 
-  let scoreVenda = 0;
-  if (lastRSI > 70) scoreVenda += 1.5;
-  if (lastMACD.MACD < lastMACD.signal) scoreVenda += 1.5;
-  if (isDownTrend) scoreVenda += 1;
-  if (adxStrong) scoreVenda += 1;
+  const { pivot, R1, S1 } = pivots;
 
-  if (scoreCompra >= ALERT_SCORE_THRESHOLD && canSendAlert(symbol, "compra")) {
-    const entry = closePrice;
-    const sl = calculateSL(entry, lastATR, 'long');
-    const tp = calculateTP(entry, lastATR, 'long');
-    const msg = formatAlertMessage(symbol, "compra", entry, sl, tp, lastRSI, lastMACD, lastADX, scoreCompra);
-    await sendTelegramAlert(chatId, msg);
-    console.log(`[${new Date().toLocaleTimeString()}] Alerta enviado: ${symbol} (COMPRA) Score: ${scoreCompra.toFixed(2)}`);
+  // Compra (rompimento R1)
+  if (
+    prevCandle.close <= R1 &&
+    lastCandle.close > R1 &&
+    isStrongCandle(lastCandle) &&
+    isHighVolume(lastCandle, avgVolume)
+  ) {
+    const distRetest = Math.abs(lastCandle.close - R1) / R1;
+    if (distRetest <= 0.002) {
+      const entry = lastCandle.close;
+      const sl = pivot;
+      const risk = entry - sl;
+      const tp = entry + risk * 3;
 
-  } else if (scoreVenda >= ALERT_SCORE_THRESHOLD && canSendAlert(symbol, "venda")) {
-    const entry = closePrice;
-    const sl = calculateSL(entry, lastATR, 'short');
-    const tp = calculateTP(entry, lastATR, 'short');
-    const msg = formatAlertMessage(symbol, "venda", entry, sl, tp, lastRSI, lastMACD, lastADX, scoreVenda);
-    await sendTelegramAlert(chatId, msg);
-    console.log(`[${new Date().toLocaleTimeString()}] Alerta enviado: ${symbol} (VENDA) Score: ${scoreVenda.toFixed(2)}`);
+      if (canSendAlert(symbol, 'compra')) {
+        const time = new Date().toISOString();
+        const msg = formatAlertMessage(symbol, 'compra', entry, sl, tp, time);
+        await sendTelegramAlert(chatId, msg);
+        console.log(`[${time}] Alerta COMPRA enviado para ${symbol} (${timeframe})`);
+      }
+    }
+  }
+  // Venda (rompimento S1)
+  else if (
+    prevCandle.close >= S1 &&
+    lastCandle.close < S1 &&
+    isStrongCandle(lastCandle) &&
+    isHighVolume(lastCandle, avgVolume)
+  ) {
+    const distRetest = Math.abs(lastCandle.close - S1) / S1;
+    if (distRetest <= 0.002) {
+      const entry = lastCandle.close;
+      const sl = pivot;
+      const risk = sl - entry;
+      const tp = entry - risk * 3;
 
+      if (canSendAlert(symbol, 'venda')) {
+        const time = new Date().toISOString();
+        const msg = formatAlertMessage(symbol, 'venda', entry, sl, tp, time);
+        await sendTelegramAlert(chatId, msg);
+        console.log(`[${time}] Alerta VENDA enviado para ${symbol} (${timeframe})`);
+      }
+    }
   } else {
-    console.log(`[${symbol}] Nenhum sinal forte. Scores: Compra=${scoreCompra.toFixed(2)}, Venda=${scoreVenda.toFixed(2)}`);
+    const time = new Date().toISOString();
+    console.log(`[${time}] ${symbol} (${timeframe}): Nenhum sinal válido.`);
   }
 }
 
